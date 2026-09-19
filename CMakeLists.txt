@@ -2603,6 +2603,7 @@ if (ENGINE_BUILD_WARMBENCH)
     add_engine_warmbench(kroko_asr_streaming_probe tests/kroko_asr/kroko_asr_streaming_probe.cpp)
     add_engine_warmbench(kroko_asr_zipformer_probe tests/kroko_asr/kroko_asr_zipformer_probe.cpp)
     add_engine_warmbench(pocket_tts_warm_bench tests/pocket_tts/pocket_tts_warm_bench.cpp)
+    add_engine_warmbench(confucius4_r2t2_warm_bench tests/confucius4_r2t2/confucius4_r2t2_warm_bench.cpp)
     add_engine_warmbench(qwen3_asr_warm_bench tests/qwen3_asr/qwen3_asr_warm_bench.cpp)
     add_engine_warmbench(qwen3_forced_aligner_warm_bench tests/qwen3_forced_aligner/qwen3_forced_aligner_warm_bench.cpp)
     add_engine_warmbench(mms_forced_aligner_warm_bench tests/mms_forced_aligner/mms_forced_aligner_warm_bench.cpp)
@@ -2991,6 +2992,9 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
             add_executable(test_confucius4_r2t2_graph_reuse tests/confucius4_r2t2/test_graph_reuse.cpp)
             target_compile_definitions(test_confucius4_r2t2_graph_reuse PRIVATE ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
             target_link_libraries(test_confucius4_r2t2_graph_reuse PRIVATE engine_runtime ggml)
+            add_executable(probe_confucius4_r2t2_prefix_stability tests/confucius4_r2t2/probe_prefix_stability.cpp)
+            target_compile_definitions(probe_confucius4_r2t2_prefix_stability PRIVATE ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+            target_link_libraries(probe_confucius4_r2t2_prefix_stability PRIVATE engine_runtime ggml)
             add_executable(test_confucius4_r2t2_transcription
                 tests/confucius4_r2t2/test_confucius4_r2t2_transcription.cpp
             )

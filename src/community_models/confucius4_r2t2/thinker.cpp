@@ -48,6 +48,36 @@ runtime::GreedyQwenDecoderSpec make_decoder_spec(const R2T2ASRConfig & config) {
 
 }  // namespace
 
+namespace {
+
+runtime::GreedyQwenDecoderRuntime::Prompt make_decoder_prompt(
+    const R2T2ASRConfig & config,
+    const R2T2ASRPrompt & prompt,
+    const R2T2ASRAudioEmbeddings & audio_embeddings) {
+    if (prompt.input_ids.empty()) {
+        throw std::runtime_error("R2T2 ASR thinker prompt is empty");
+    }
+    const auto & text = config.text_decoder;
+    if (audio_embeddings.hidden_size != text.hidden_size ||
+        audio_embeddings.tokens != static_cast<int64_t>(prompt.audio_token_positions.size()) ||
+        static_cast<int64_t>(audio_embeddings.values.size()) != audio_embeddings.tokens * text.hidden_size) {
+        throw std::runtime_error("R2T2 ASR audio embeddings do not match the prompt placeholders");
+    }
+    for (const int32_t position : prompt.audio_token_positions) {
+        if (position < 0 || position >= static_cast<int32_t>(prompt.input_ids.size())) {
+            throw std::runtime_error("R2T2 ASR audio placeholder position out of range");
+        }
+    }
+    runtime::GreedyQwenDecoderRuntime::Prompt decoder_prompt;
+    decoder_prompt.input_ids = prompt.input_ids;
+    decoder_prompt.injection.values = audio_embeddings.values;
+    decoder_prompt.injection.tokens = audio_embeddings.tokens;
+    decoder_prompt.injection.positions = prompt.audio_token_positions;
+    return decoder_prompt;
+}
+
+}  // namespace
+
 struct R2T2ASRThinkerRuntime::Impl {
     Impl(
         std::shared_ptr<const R2T2ASRAssets> assets,
@@ -91,29 +121,26 @@ R2T2ASRGeneratedTokens R2T2ASRThinkerRuntime::generate(
     const R2T2ASRPrompt & prompt,
     const R2T2ASRAudioEmbeddings & audio_embeddings,
     const R2T2ASRGenerationOptions & options) {
-    if (prompt.input_ids.empty()) {
-        throw std::runtime_error("R2T2 ASR thinker prompt is empty");
-    }
-    const auto & text = impl_->config.text_decoder;
-    if (audio_embeddings.hidden_size != text.hidden_size ||
-        audio_embeddings.tokens != static_cast<int64_t>(prompt.audio_token_positions.size()) ||
-        static_cast<int64_t>(audio_embeddings.values.size()) != audio_embeddings.tokens * text.hidden_size) {
-        throw std::runtime_error("R2T2 ASR audio embeddings do not match the prompt placeholders");
-    }
-    for (const int32_t position : prompt.audio_token_positions) {
-        if (position < 0 || position >= static_cast<int32_t>(prompt.input_ids.size())) {
-            throw std::runtime_error("R2T2 ASR audio placeholder position out of range");
-        }
-    }
-    runtime::GreedyQwenDecoderRuntime::Prompt decoder_prompt;
-    decoder_prompt.input_ids = prompt.input_ids;
-    decoder_prompt.injection.values = audio_embeddings.values;
-    decoder_prompt.injection.tokens = audio_embeddings.tokens;
-    decoder_prompt.injection.positions = prompt.audio_token_positions;
-
     R2T2ASRGeneratedTokens out;
-    out.token_ids = impl_->runtime.generate(decoder_prompt, options.max_new_tokens, options.reuse_graphs);
+    out.token_ids = impl_->runtime.generate(make_decoder_prompt(impl_->config, prompt, audio_embeddings), options.max_new_tokens, options.reuse_graphs);
     return out;
+}
+
+R2T2ASRGeneratedTokens R2T2ASRThinkerRuntime::generate_streaming(
+    const R2T2ASRPrompt & prompt,
+    const R2T2ASRAudioEmbeddings & audio_embeddings,
+    const R2T2ASRGenerationOptions & options) {
+    R2T2ASRGeneratedTokens out;
+    out.token_ids = impl_->runtime.generate_streaming(make_decoder_prompt(impl_->config, prompt, audio_embeddings), options.max_new_tokens);
+    return out;
+}
+
+void R2T2ASRThinkerRuntime::reset_streaming() {
+    impl_->runtime.reset_streaming();
+}
+
+void R2T2ASRThinkerRuntime::set_prefill_block_steps(int64_t block_steps) {
+    impl_->runtime.set_prefill_block_steps(block_steps);
 }
 
 }  // namespace engine::community_models::confucius4_r2t2

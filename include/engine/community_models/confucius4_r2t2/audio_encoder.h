@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace engine::community_models::confucius4_r2t2 {
 
@@ -27,6 +28,18 @@ public:
 
     R2T2ASRAudioEmbeddings encode(const R2T2ASRAudioFeatures & features, bool reuse_graph = false);
 
+    // Streaming incremental encode for growing audio: embeddings of completed
+    // attention windows are bitwise-frozen (block-diagonal window attention
+    // plus chunk-local convolutions), so they are cached and re-validated
+    // against the current mel features; only the current partial window is
+    // re-encoded with an exact graph. Any condition that could differ from
+    // the full reusable encode (cache cold, mel prefix changed, degenerate
+    // tail) falls back to encode(features, true), keeping the output
+    // bit-identical to a full re-encode. reset_streaming() drops the cache
+    // when a stream restarts.
+    R2T2ASRAudioEmbeddings encode_streaming(const R2T2ASRAudioFeatures & features);
+    void reset_streaming();
+
 private:
     std::shared_ptr<const R2T2ASRAssets> assets_;
     std::shared_ptr<const R2T2ASRAudioEncoderWeights> weights_;
@@ -34,6 +47,11 @@ private:
     size_t graph_arena_bytes_ = 0;
     int64_t graph_capacity_frames_ = 0;
     std::unique_ptr<R2T2ASRAudioEncoderGraph> graph_;
+    std::vector<float> streaming_mel_;
+    int64_t streaming_frames_ = 0;
+    std::vector<float> streaming_embeddings_;
+    int64_t streaming_tokens_ = 0;
+    bool streaming_valid_ = false;
 };
 
 }  // namespace engine::community_models::confucius4_r2t2

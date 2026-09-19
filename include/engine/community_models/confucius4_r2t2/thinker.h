@@ -33,6 +33,18 @@ public:
         const R2T2ASRAudioEmbeddings & audio_embeddings,
         const R2T2ASRGenerationOptions & options);
 
+    // Streaming variant with KV prefix reuse (see
+    // runtime::GreedyQwenDecoderRuntime::generate_streaming). Falls back to a
+    // full re-prefill whenever the prompt prefix is not bitwise unchanged.
+    R2T2ASRGeneratedTokens generate_streaming(
+        const R2T2ASRPrompt & prompt,
+        const R2T2ASRAudioEmbeddings & audio_embeddings,
+        const R2T2ASRGenerationOptions & options);
+    void reset_streaming();
+    // Bounded-block prefill width (default 64); see
+    // runtime::GreedyQwenDecoderRuntime::set_prefill_block_steps.
+    void set_prefill_block_steps(int64_t block_steps);
+
 private:
     std::unique_ptr<Impl> impl_;
 };

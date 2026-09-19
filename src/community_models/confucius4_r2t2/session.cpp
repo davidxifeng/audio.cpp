@@ -134,6 +134,17 @@ R2T2ASRSession::R2T2ASRSession(
     if (stream_config_.max_new_tokens <= 0) {
         throw std::runtime_error("confucius4_r2t2.max_tokens must be positive");
     }
+    // 256 keeps typical streaming tails (new audio tokens plus regenerated
+    // text) inside one bounded prefill block; measured flat versus 512 on the
+    // reference clip and faster than 64/128, with identical transcripts.
+    int64_t prefill_block_steps = 256;
+    if (const auto value = runtime::parse_int_option(options.options, {"confucius4_r2t2.prefill_block_steps"})) {
+        prefill_block_steps = *value;
+    }
+    if (prefill_block_steps <= 0 || prefill_block_steps > 512) {
+        throw std::runtime_error("confucius4_r2t2.prefill_block_steps must be in (0, 512]");
+    }
+    thinker_.set_prefill_block_steps(prefill_block_steps);
     for (const auto & [key, value] : options.options) {
         (void) value;
         if (key.rfind("confucius4_r2t2.", 0) == 0 &&
@@ -147,6 +158,7 @@ R2T2ASRSession::R2T2ASRSession(
             key != "confucius4_r2t2.chunk_size_ms" &&
             key != "confucius4_r2t2.unfixed_chunk_num" &&
             key != "confucius4_r2t2.unfixed_token_num" &&
+            key != "confucius4_r2t2.prefill_block_steps" &&
             key != "confucius4_r2t2.rollback_punctuation" &&
             key != "confucius4_r2t2.max_tokens") {
             throw std::runtime_error("unknown R2T2 ASR session option: " + key);
@@ -275,7 +287,11 @@ std::string R2T2ASRSession::generate_text(
     R2T2ASRGenerationOptions options;
     options.max_new_tokens = stream_config_.max_new_tokens;
     options.reuse_graphs = true;
-    const auto tokens = thinker_.generate(prompt, embeddings, options);
+    // Prefix-reusing variant: re-prefills only the prompt tail that changed
+    // since the previous chunk and falls back to a full re-prefill whenever
+    // the prefix is not bitwise identical, keeping deltas and final text
+    // identical to a full-recompute run.
+    const auto tokens = thinker_.generate_streaming(prompt, embeddings, options);
     return tokenizer_.decode(tokens.token_ids);
 }
 
@@ -330,7 +346,10 @@ R2T2ASRSession::StreamOutcome R2T2ASRSession::decode_stream_chunk(bool final_flu
     accum.samples = audio_accum_;
     const auto features = frontend_.extract(accum);
     const auto prompt = tokenizer_.build_raw_audio_prompt(prompt_raw_ + prefix, features.encoder_tokens);
-    const auto embeddings = audio_encoder_.encode(features, /*reuse_graph=*/true);
+    // Incremental streaming encode: reuses bitwise-frozen attention-window
+    // embeddings and re-encodes only the current partial window; falls back
+    // to the full reusable encode whenever the frozen prefix could differ.
+    const auto embeddings = audio_encoder_.encode_streaming(features);
     std::string generated = generate_text(prompt, embeddings);
     generated = normalize_punct_by_context(generated);
     generated = sanitize_utf8_lossy(generated);
@@ -473,6 +492,9 @@ void R2T2ASRSession::reset() {
     stream_channels_ = 1;
     stream_started_ = false;
     stream_wall_start_ = {};
+    // A restarted stream must not reuse KV from the previous stream's prompt.
+    thinker_.reset_streaming();
+    audio_encoder_.reset_streaming();
 }
 
 runtime::StreamEvent R2T2ASRSession::process_audio_chunk(const runtime::AudioChunk & chunk) {

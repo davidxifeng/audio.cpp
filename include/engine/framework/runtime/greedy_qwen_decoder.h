@@ -66,6 +66,19 @@ public:
     // growing prompts. Each call still recomputes the full prompt.
     std::vector<int32_t> generate(const Prompt & prompt, int64_t max_new_tokens, bool reuse_graphs = false);
 
+    // Streaming variant with KV prefix reuse for growing prompts. Reuses the
+    // retained decode cache for the longest bitwise-unchanged prompt-embedding
+    // prefix and re-prefills only the changed tail; capacity growth exports
+    // and re-imports the KV state. Any mismatch or inconsistency falls back
+    // to a full re-prefill, so observable behaviour matches generate(). The
+    // caller must call reset_streaming() when the logical stream restarts.
+    std::vector<int32_t> generate_streaming(const Prompt & prompt, int64_t max_new_tokens);
+    void reset_streaming();
+
+    // Bounded-block prefill width for the reusable and streaming paths.
+    // Must be positive; 64 keeps the historical behaviour.
+    void set_prefill_block_steps(int64_t block_steps);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

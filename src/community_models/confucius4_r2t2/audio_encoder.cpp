@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -656,6 +657,104 @@ R2T2ASRAudioEmbeddings R2T2ASRAudioEncoderRuntime::encode(const R2T2ASRAudioFeat
     if (out.tokens != features.encoder_tokens) {
         throw std::runtime_error("R2T2 ASR audio encoder output token count mismatch");
     }
+    return out;
+}
+
+void R2T2ASRAudioEncoderRuntime::reset_streaming() {
+    streaming_mel_.clear();
+    streaming_mel_.shrink_to_fit();
+    streaming_embeddings_.clear();
+    streaming_embeddings_.shrink_to_fit();
+    streaming_frames_ = 0;
+    streaming_tokens_ = 0;
+    streaming_valid_ = false;
+}
+
+R2T2ASRAudioEmbeddings R2T2ASRAudioEncoderRuntime::encode_streaming(const R2T2ASRAudioFeatures & features) {
+    const auto & config = assets_->config.audio_encoder;
+    const int64_t chunk_frames = config.n_window * 2;
+    const int64_t window_chunks = config.n_window_infer / chunk_frames;
+    const int64_t mel_bins = config.num_mel_bins;
+    const auto full_reencode = [&]() {
+        auto out = encode(features, true);
+        streaming_mel_ = features.values;
+        streaming_frames_ = features.frames;
+        streaming_embeddings_ = out.values;
+        streaming_tokens_ = out.tokens;
+        streaming_valid_ = true;
+        return out;
+    };
+    if (window_chunks <= 0 || features.mel_bins != mel_bins ||
+        features.values.size() != static_cast<size_t>(mel_bins * features.frames)) {
+        return full_reencode();
+    }
+    const int64_t chunk_count = (features.frames + chunk_frames - 1) / chunk_frames;
+    (void) chunk_count;
+    // Completed attention windows freeze bit-exactly: their chunks are fully
+    // populated, convolutions are chunk-local, and the block-diagonal mask
+    // isolates each window. Only fully populated chunks count.
+    const int64_t full_chunks = features.frames / chunk_frames;
+    const int64_t frozen_chunks = (full_chunks / window_chunks) * window_chunks;
+    if (frozen_chunks == 0) {
+        return full_reencode();
+    }
+    const int64_t frozen_frames = frozen_chunks * chunk_frames;
+    const int64_t frozen_tokens = frozen_chunks * confucius4_r2t2_audio_encoder_token_count(chunk_frames);
+    // Revalidate the cached prefix against the current mel, bin by bin (the
+    // layout is [bin][frame], and the cached stride may differ). The global
+    // log-mel floor can move previously frozen values, so this check is what
+    // keeps the fast path bit-identical to a full re-encode.
+    if (!streaming_valid_ || streaming_frames_ < frozen_frames ||
+        streaming_tokens_ != confucius4_r2t2_audio_encoder_token_count(streaming_frames_) ||
+        streaming_embeddings_.size() != static_cast<size_t>(streaming_tokens_ * config.output_dim)) {
+        return full_reencode();
+    }
+    for (int64_t bin = 0; bin < mel_bins; ++bin) {
+        const float * cached = streaming_mel_.data() + bin * streaming_frames_;
+        const float * current = features.values.data() + bin * features.frames;
+        if (std::memcmp(cached, current, static_cast<size_t>(frozen_frames) * sizeof(float)) != 0) {
+            return full_reencode();
+        }
+    }
+    const int64_t tail_frames = features.frames - frozen_frames;
+    R2T2ASRAudioEmbeddings out;
+    out.hidden_size = config.output_dim;
+    out.tokens = frozen_tokens;
+    // The cached prefix is token-major; frozen rows are its first rows.
+    out.values.assign(streaming_embeddings_.begin(),
+                      streaming_embeddings_.begin() + static_cast<std::ptrdiff_t>(frozen_tokens * config.output_dim));
+    if (tail_frames > 0) {
+        if (tail_frames < chunk_frames) {
+            // A tail of a single partial chunk would build an exact graph with
+            // a narrower convolution width than the full encode uses for the
+            // same chunk, so reuse would no longer be bit-identical.
+            return full_reencode();
+        }
+        R2T2ASRAudioFeatures tail;
+        tail.frames = tail_frames;
+        tail.mel_bins = mel_bins;
+        tail.values.resize(static_cast<size_t>(mel_bins * tail_frames));
+        for (int64_t bin = 0; bin < mel_bins; ++bin) {
+            std::copy_n(features.values.data() + bin * features.frames + frozen_frames,
+                        tail_frames,
+                        tail.values.data() + bin * tail_frames);
+        }
+        tail.attention_mask.assign(static_cast<size_t>(confucius4_r2t2_audio_encoder_token_count(tail_frames)), 1);
+        tail.encoder_tokens = confucius4_r2t2_audio_encoder_token_count(tail_frames);
+        // The tail spans at most one attention window, so the exact graph's
+        // single all-visible window reproduces the full encode bit-exactly.
+        auto tail_out = encode(tail, /*reuse_graph=*/false);
+        if (tail_out.tokens != tail.encoder_tokens) {
+            throw std::runtime_error("R2T2 ASR audio encoder tail token count mismatch");
+        }
+        out.values.insert(out.values.end(), tail_out.values.begin(), tail_out.values.end());
+        out.tokens += tail_out.tokens;
+    }
+    streaming_mel_ = features.values;
+    streaming_frames_ = features.frames;
+    streaming_embeddings_ = out.values;
+    streaming_tokens_ = out.tokens;
+    streaming_valid_ = true;
     return out;
 }
 

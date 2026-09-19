@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -670,8 +671,28 @@ struct GreedyQwenDecoderRuntime::Impl {
     core::ExecutionContext * execution;
     std::unique_ptr<PromptEmbeddingGraph> embedding_graph;
     std::unique_ptr<modules::QwenCausalDecodeRuntime> reusable_decoder;
+    std::vector<float> streaming_embeddings_;
+    int64_t streaming_tokens_ = 0;
+    bool streaming_valid_ = false;
+    int64_t prefill_block_steps_ = 64;
 
     std::vector<int32_t> generate_reusing_graphs(const GreedyQwenDecoderRuntime::Prompt & prompt, int64_t max_new_tokens) {
+        ensure_reusable_runtime();
+        auto embeddings = compute_prompt_embeddings(prompt);
+        const auto & spec = weights->spec();
+        const int64_t steps = static_cast<int64_t>(prompt.input_ids.size());
+        const int64_t required = steps + max_new_tokens;
+        // Grow in bounded capacity buckets, keeping only one decode and one
+        // block-prefill graph. A new prompt clears KV on device, not via a
+        // host export/import of every layer.
+        const int64_t capacity = std::min(spec.max_position_embeddings, (required + 127) / 128 * 128);
+        const auto start = Clock::now();
+        auto logits = reusable_decoder->prefill_embeddings_into_cache(embeddings, steps, capacity, prefill_block_steps_).logits;
+        debug::timing_log_scalar("greedy_qwen_decoder.reusable.prefill_ms", engine::debug::elapsed_ms(start));
+        return run_decode_loop(spec, logits, max_new_tokens);
+    }
+
+    void ensure_reusable_runtime() {
         const auto & spec = weights->spec();
         if (!reusable_decoder) {
             modules::QwenCausalDecodeRuntimeConfig config;
@@ -692,31 +713,107 @@ struct GreedyQwenDecoderRuntime::Impl {
         if (!embedding_graph) {
             embedding_graph = std::make_unique<PromptEmbeddingGraph>(weights);
         }
+    }
+
+    std::vector<float> compute_prompt_embeddings(const GreedyQwenDecoderRuntime::Prompt & prompt) {
+        const int64_t width = weights->spec().decoder.stack.hidden_size;
         auto embeddings = embedding_graph->run(prompt.input_ids);
-        const int64_t width = spec.decoder.stack.hidden_size;
         for (size_t i = 0; i < prompt.injection.positions.size(); ++i) {
             std::copy_n(prompt.injection.values.data() + i * width, width,
                         embeddings.data() + prompt.injection.positions[i] * width);
         }
-        const int64_t steps = static_cast<int64_t>(prompt.input_ids.size());
-        const int64_t required = steps + max_new_tokens;
-        // Grow in bounded capacity buckets, keeping only one decode and one
-        // block-prefill graph. A new prompt clears KV on device, not via a
-        // host export/import of every layer.
-        const int64_t capacity = std::min(spec.max_position_embeddings, (required + 127) / 128 * 128);
-        const auto start = Clock::now();
-        auto logits = reusable_decoder->prefill_embeddings_into_cache(embeddings, steps, capacity, 64).logits;
-        debug::timing_log_scalar("greedy_qwen_decoder.reusable.prefill_ms", engine::debug::elapsed_ms(start));
+        return embeddings;
+    }
+
+    std::vector<int32_t> run_decode_loop(const GreedyQwenDecoderSpec & spec, std::vector<float> & logits, int64_t max_new_tokens) {
         std::vector<int32_t> out;
+        const auto decode_start = Clock::now();
+        int64_t decode_steps = 0;
         for (int64_t step = 0; step < max_new_tokens; ++step) {
             const int32_t token = argmax_index(logits);
             if (is_eos(spec, token)) { break; }
             out.push_back(token);
             if (step + 1 < max_new_tokens) {
                 logits = reusable_decoder->decode_token(token).logits;
+                ++decode_steps;
             }
         }
+        debug::timing_log_scalar("greedy_qwen_decoder.reusable.decode_ms", engine::debug::elapsed_ms(decode_start));
+        debug::timing_log_scalar("greedy_qwen_decoder.reusable.decode_steps", decode_steps);
         return out;
+    }
+
+    // Longest common prefix (in prompt tokens) of bitwise-identical embedding
+    // rows between the previous and current prompt. Rows for cached positions
+    // never change on the backend while reused, so equality here is exactly
+    // the condition for the retained KV to stay valid.
+    int64_t common_prompt_prefix(const std::vector<float> & embeddings, int64_t total) const {
+        if (!streaming_valid_) {
+            return 0;
+        }
+        const int64_t width = weights->spec().decoder.stack.hidden_size;
+        const int64_t common = std::min(streaming_tokens_, total);
+        for (int64_t token = 0; token < common; ++token) {
+            if (std::memcmp(streaming_embeddings_.data() + token * width,
+                            embeddings.data() + token * width,
+                            static_cast<size_t>(width) * sizeof(float)) != 0) {
+                return token;
+            }
+        }
+        return common;
+    }
+
+    std::vector<int32_t> generate_streaming(const GreedyQwenDecoderRuntime::Prompt & prompt, int64_t max_new_tokens) {
+        const auto & spec = weights->spec();
+        ensure_reusable_runtime();
+        auto embeddings = compute_prompt_embeddings(prompt);
+        const int64_t steps = static_cast<int64_t>(prompt.input_ids.size());
+        const int64_t required = steps + max_new_tokens;
+        const int64_t capacity = std::min(spec.max_position_embeddings, (required + 127) / 128 * 128);
+        int64_t reuse = common_prompt_prefix(embeddings, steps);
+        if (reuse >= steps) {
+            // Nothing new to prefill; recompute instead of reproducing logits
+            // outside the block-prefill path.
+            reuse = 0;
+        }
+        if (reuse > 0 && reuse > reusable_decoder->decode_valid_steps()) {
+            reuse = 0;  // defensive: retained cache shorter than the prefix
+        }
+        std::vector<float> logits;
+        if (reuse == 0) {
+            const auto start = Clock::now();
+            logits = reusable_decoder->prefill_embeddings_into_cache(embeddings, steps, capacity, prefill_block_steps_).logits;
+            debug::timing_log_scalar("greedy_qwen_decoder.reusable.prefill_ms", engine::debug::elapsed_ms(start));
+        } else {
+            if (capacity > reusable_decoder->decode_cache_steps()) {
+                // Grow the capacity bucket without losing the retained prefix.
+                auto state = reusable_decoder->export_decode_state();
+                reusable_decoder->ensure_decode_token_capacity(capacity);
+                reusable_decoder->start_decode_tokens(state, capacity);
+            }
+            reusable_decoder->retain_decode_prefix(reuse);
+            const auto start = Clock::now();
+            const int64_t width = spec.decoder.stack.hidden_size;
+            logits = reusable_decoder
+                ->append_prefill_embeddings_into_cache(
+                    embeddings.data() + reuse * width, steps - reuse, prefill_block_steps_)
+                .logits;
+            debug::timing_log_scalar("greedy_qwen_decoder.reusable.append_prefill_ms", engine::debug::elapsed_ms(start));
+        }
+        debug::timing_log_scalar("greedy_qwen_decoder.reusable.streaming.reuse_tokens", reuse);
+        debug::timing_log_scalar("greedy_qwen_decoder.reusable.streaming.prompt_tokens", steps);
+        auto out = run_decode_loop(spec, logits, max_new_tokens);
+        streaming_embeddings_ = std::move(embeddings);
+        streaming_tokens_ = steps;
+        streaming_valid_ = true;
+        return out;
+    }
+
+    void reset_streaming() {
+        streaming_embeddings_.clear();
+        streaming_embeddings_.shrink_to_fit();
+        streaming_tokens_ = 0;
+        streaming_valid_ = false;
     }
 
 };
@@ -799,6 +896,38 @@ std::vector<int32_t> GreedyQwenDecoderRuntime::generate(const Prompt & prompt, i
         logits = impl_->decode_graph->run_step(token);
     }
     return out;
+}
+
+std::vector<int32_t> GreedyQwenDecoderRuntime::generate_streaming(const Prompt & prompt, int64_t max_new_tokens) {
+    const auto & spec = impl_->weights->spec();
+    if (prompt.input_ids.empty()) {
+        throw std::runtime_error("greedy Qwen decoder prompt is empty");
+    }
+    if (max_new_tokens <= 0) {
+        throw std::runtime_error("greedy Qwen decoder max_new_tokens must be positive");
+    }
+    const int64_t prompt_steps = static_cast<int64_t>(prompt.input_ids.size());
+    if (prompt_steps + max_new_tokens > spec.max_position_embeddings) {
+        throw std::runtime_error("greedy Qwen decoder request exceeds max_position_embeddings");
+    }
+    const auto & injection = prompt.injection;
+    if (injection.tokens < 0 || injection.tokens > prompt_steps ||
+        static_cast<int64_t>(injection.positions.size()) != injection.tokens ||
+        static_cast<int64_t>(injection.values.size()) != injection.tokens * spec.decoder.stack.hidden_size) {
+        throw std::runtime_error("greedy Qwen decoder injection shape does not match the prompt");
+    }
+    return impl_->generate_streaming(prompt, max_new_tokens);
+}
+
+void GreedyQwenDecoderRuntime::reset_streaming() {
+    impl_->reset_streaming();
+}
+
+void GreedyQwenDecoderRuntime::set_prefill_block_steps(int64_t block_steps) {
+    if (block_steps <= 0 || block_steps > 512) {
+        throw std::runtime_error("greedy Qwen decoder prefill block steps must be in (0, 512]");
+    }
+    impl_->prefill_block_steps_ = block_steps;
 }
 
 }  // namespace engine::runtime

@@ -84,6 +84,24 @@ public:
     QwenCausalDecodeStepResult prefill_embeddings_into_cache(
         const std::vector<float> & embeddings, int64_t steps, int64_t cache_steps, int64_t chunk_steps);
 
+    // Streaming prefix-reuse primitives. retain_decode_prefix truncates the
+    // retained KV state in place with no data movement: rows below the prefix
+    // stay valid on the backend and later appends overwrite the released tail.
+    void retain_decode_prefix(int64_t prefix_steps);
+    // Host snapshot of the non-batched decode KV cache, for re-import via
+    // start_decode_tokens after a decode-graph capacity rebuild.
+    runtime::TransformerKVState export_decode_state() const;
+    // Make the token-decode graph hold at least cache_steps steps. Rebuilds
+    // the graph and empties its cache when the capacity bucket must grow.
+    void ensure_decode_token_capacity(int64_t cache_steps);
+    // Bounded-block prefill that appends at the current end of the decode
+    // cache without clearing it; positions continue from the retained prefix.
+    // The caller must ensure the decode graph exists (ensure_decode_token_capacity)
+    // and has room for the appended steps. embeddings holds steps rows of
+    // hidden_size floats (token-major).
+    QwenCausalDecodeStepResult append_prefill_embeddings_into_cache(
+        const float * embeddings, int64_t steps, int64_t chunk_steps);
+
     QwenCausalBatchedPrefillResult prefill_tokens_batched(
         const std::vector<int32_t> & token_ids,
         int64_t batch_size,
